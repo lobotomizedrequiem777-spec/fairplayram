@@ -1,0 +1,9 @@
+name: similitud-juegos
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      # Mismas versiones fijas que usa pip y GitHub Actions
+      - -r requirements.txt

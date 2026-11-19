@@ -1,0 +1,204 @@
+"""Reseñas de usuarios de Steam como pista para encontrar pares sospechosos.
+
+Idea (sugerida por el profesor): los jugadores suelen ser los primeros en escribir
+"esto es una copia de X". Este módulo busca esas reseñas para decidir **qué pares
+etiquetar primero**. No es una señal del modelo ni una prueba: la decisión sigue siendo humana.
+
+Qué se mide en las reseñas de un juego
+--------------------------------------
+* alerta:  la reseña usa una expresión como "clone", "rip-off", "asset flip", "stolen" o "copia".
+* mención: cerca de esa expresión se nombra a OTRO juego conocido del catálogo ("clone of X").
+           Eso apunta a un par concreto.
+
+Cuidados
+--------
+* "Clone" también se usa como género ("un clon de Stardew muy bueno"): es una pista, no una acusación.
+* Las reseñas son texto de usuarios: se guardan en Drive, nunca en el repositorio.
+* Se consulta la tienda de Steam con una pausa entre juegos, para no sobrecargarla.
+
+Ejemplo
+-------
+    titulos = Titulos({1: "Escape the Walls", 2: "Escape Walls Obby"})
+    analizar(2, ["A shameless clone of Escape the Walls", "fun game"], titulos)
+    # {'appid': 2, 'n_resenas': 2, 'n_alerta': 1, 'frac_alerta': 0.5,
+    #  'menciones': {1: 1}, 'ejemplo': 'A shameless clone of Escape the Walls'}
+"""
+from __future__ import annotations
+
+import json
+import re
+import time
+import urllib.error
+import urllib.request
+from collections import Counter
+
+# La tienda responde en esta ruta; la documentada (/appreviews/) hoy redirige a la portada.
+URLS = ["https://store.steampowered.com/ajaxappreviews/{appid}",
+        "https://store.steampowered.com/appreviews/{appid}"]
+# filter=recent trae las más recientes sin límite de fecha (filter=all solo mira los últimos días)
+PARAMETROS = "?json=1&filter=recent&language=all&purchase_type=all&num_per_page={n}"
+
+# Expresiones que suelen aparecer cuando alguien denuncia una copia (inglés y español).
+# Quedan fuera a propósito, porque casi siempre significan otra cosa:
+#   "copy" y "copy of": "ejemplar" ("I bought a copy", "a digital copy of the game")
+#   "steal":            "ganga" ("at this price it's a steal")
+ALERTAS = re.compile(
+    r"\b(clon(e|ed|es|ing)?|copycat|copied|copy[- ]?paste[d]?|carbon copy|"
+    r"(blatant|cheap|shameless|exact|direct|straight) cop(y|ies)|"
+    r"rip[- ]?off|ripoff|ripped off|knock[- ]?off|asset[- ]?flip|bootleg|stolen|stole|"
+    r"plagiari[sz](m|ed|es|e)|reskin(ned)?|"
+    r"copia(do|da|ron)?|clon(ado|ada|es)?|plagio|plagiado|robad[oa]s?)\b", re.IGNORECASE)
+
+_PALABRA = re.compile(r"[a-z0-9]+")
+_TOKEN = re.compile(r"[A-Za-z0-9]+")
+_FORMATO = re.compile(r"\[/?[a-z0-9*]+(=[^\]]*)?\]", re.IGNORECASE)     # marcas de formato de Steam: [b], [/h1], [url=...]
+MAX_PALABRAS_TITULO = 6
+VENTANA = 80     # caracteres antes y después de la alerta donde se busca el nombre de otro juego
+# Palabras que pueden ir entre la alerta y el nombre: "clone OF Terraria", "copia DE Terraria"
+RELLENO = {"of", "the", "a", "an", "from", "to", "de", "del", "la", "el", "un", "una"}
+
+
+def tiene_alerta(texto: str) -> bool:
+    """True si la reseña usa alguna expresión de copia. Ej.: "total rip-off" -> True."""
+    return bool(ALERTAS.search(texto or ""))
+
+
+def _normalizar(texto: str) -> list[str]:
+    """Minúsculas y solo letras y números: "Vampire Survivors!" -> ["vampire", "survivors"]."""
+    return _PALABRA.findall((texto or "").lower())
+
+
+class Titulos:
+    """Índice de títulos del catálogo para encontrar qué juegos nombra una reseña.
+
+    Solo entran títulos distintivos, porque muchos juegos se llaman como palabras comunes
+    ("Strategy", "Controller"):
+    * de dos o más palabras, o de una palabra de al menos `min_letras` letras;
+    * si se pasa `resenas` ({appid: número de reseñas}), solo juegos conocidos: al menos
+      `min_resenas` reseñas, y cinco veces más si el título es de una sola palabra.
+    """
+
+    def __init__(self, nombres: dict[int, str], resenas: dict[int, int] | None = None,
+                 min_resenas: int = 500, min_letras: int = 8):
+        self.indice: dict[tuple[str, ...], int] = {}
+        self.escrito: dict[tuple[str, ...], tuple[str, ...]] = {}
+        repetidos = set()
+        for appid, nombre in nombres.items():
+            clave = tuple(_normalizar(nombre))
+            if not clave or len(clave) > MAX_PALABRAS_TITULO:
+                continue
+            if len(clave) == 1 and len(clave[0]) < min_letras:
+                continue
+            if resenas is not None and resenas.get(appid, 0) < min_resenas * (5 if len(clave) == 1 else 1):
+                continue
+            if clave in self.indice:        # dos juegos con el mismo nombre: no se sabe cuál es
+                repetidos.add(clave)
+            self.indice[clave] = int(appid)
+            self.escrito[clave] = tuple(_TOKEN.findall(nombre))     # con sus mayúsculas originales
+        for clave in repetidos:
+            del self.indice[clave]
+        self.max_palabras = max((len(c) for c in self.indice), default=0)
+
+    def _como_nombre(self, escritos: list[str], clave: tuple[str, ...]) -> bool:
+        """¿Está escrito como nombre propio?
+
+        Vale igual que en el catálogo, todo en mayúsculas o, si tiene dos o más palabras,
+        con cada palabra en mayúscula inicial ("Final Fantasy" para el juego "FINAL FANTASY").
+        """
+        if tuple(escritos) == self.escrito[clave] or all(t.isupper() or t.isdigit() for t in escritos):
+            return True
+        return len(escritos) >= 2 and all(t[0].isupper() or t[0].isdigit() for t in escritos)
+
+    def menciones(self, texto: str, propio: int | None = None, solo_nombres: bool = False) -> set[int]:
+        """appid de los juegos que nombra el texto (sin contar el propio juego).
+
+        Con `solo_nombres=True` solo cuentan los títulos escritos como nombre propio. Así
+        "find all the cards" no cuenta como una mención del juego "FIND ALL".
+        """
+        tokens = _TOKEN.findall(texto or "")
+        palabras = [t.lower() for t in tokens]
+        encontrados = set()
+        for i in range(len(palabras)):
+            for largo in range(1, self.max_palabras + 1):
+                clave = tuple(palabras[i:i + largo])
+                appid = self.indice.get(clave)
+                if appid is None or appid == propio:
+                    continue
+                if solo_nombres and not self._como_nombre(tokens[i:i + largo], clave):
+                    continue
+                encontrados.add(appid)
+        return encontrados
+
+    def pegados(self, antes: str, despues: str, propio: int | None = None) -> set[int]:
+        """Juegos nombrados justo al lado de una alerta, aunque estén en minúsculas.
+
+        `antes` y `despues` son el texto a cada lado de la expresión de alerta:
+        * justo antes:   "vampire survivors" + clone
+        * justo después: clone + "of super meat boy" (se saltan hasta 3 palabras como "of the")
+        """
+        encontrados = set()
+        previas = _normalizar(antes)
+        for largo in range(1, min(self.max_palabras, len(previas)) + 1):
+            encontrados.add(self.indice.get(tuple(previas[-largo:])))
+        siguientes = _normalizar(despues)
+        saltables = 0
+        while saltables < min(3, len(siguientes)) and siguientes[saltables] in RELLENO:
+            saltables += 1
+        for inicio in range(saltables + 1):       # el título puede empezar con "the": se prueba cada inicio
+            for largo in range(1, self.max_palabras + 1):
+                encontrados.add(self.indice.get(tuple(siguientes[inicio:inicio + largo])))
+        return encontrados - {None, propio}
+
+
+def analizar(appid: int, textos: list[str], titulos: Titulos) -> dict:
+    """Resume las reseñas de un juego: cuántas tienen alerta y a qué otros juegos nombran.
+
+    `menciones` es {appid_mencionado: número de reseñas que lo nombran cerca de una alerta}.
+    `ejemplo` es el trozo de una reseña alrededor de la alerta, para revisarla a mano.
+
+    Un juego cuenta como nombrado si está pegado a la alerta ("terraria clone", "clone of terraria")
+    o si aparece cerca escrito como nombre propio ("It's a clone. Terraria did it better").
+    """
+    con_alerta = [t for t in textos if tiene_alerta(t)]
+    menciones, ejemplos_mencion, ejemplos = Counter(), [], []
+    for t in con_alerta:
+        t = _FORMATO.sub(" ", t)      # las reseñas traen marcas como [b]...[/b] que separan el nombre de la alerta
+        nombrados = set()
+        for m in ALERTAS.finditer(t):
+            antes, despues = t[max(0, m.start() - VENTANA):m.start()], t[m.end():m.end() + VENTANA]
+            trozo = antes + m.group(0) + despues
+            encontrados = (titulos.pegados(antes, despues, propio=appid)
+                           | titulos.menciones(trozo, propio=appid, solo_nombres=True))
+            (ejemplos_mencion if encontrados else ejemplos).append(trozo)
+            nombrados |= encontrados
+        menciones.update(nombrados)
+    ejemplo = " ".join((ejemplos_mencion or ejemplos or [""])[0].split())
+    return {"appid": int(appid), "n_resenas": len(textos), "n_alerta": len(con_alerta),
+            "frac_alerta": round(len(con_alerta) / len(textos), 3) if textos else 0.0,
+            "menciones": dict(menciones), "ejemplo": ejemplo}
+
+
+def descargar(appid: int, n: int = 100, espera: float = 20.0, intentos: int = 3) -> list[str] | None:
+    """Hasta `n` reseñas (las más útiles, en cualquier idioma) de un juego. None si no se pudo.
+
+    Si la tienda responde "demasiadas consultas" (429), espera y reintenta.
+    """
+    for base in URLS:
+        url = base.format(appid=int(appid)) + PARAMETROS.format(n=min(int(n), 100))
+        for intento in range(intentos):
+            try:
+                pedido = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (proyecto académico)"})
+                with urllib.request.urlopen(pedido, timeout=30) as r:
+                    cuerpo = r.read().decode("utf-8", errors="replace")
+                datos = json.loads(cuerpo)
+                if datos.get("success") == 1:
+                    return [x.get("review", "") for x in datos.get("reviews", [])]
+                break                                   # respuesta válida pero sin éxito: probar la otra ruta
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and intento < intentos - 1:
+                    time.sleep(espera * (intento + 1))
+                    continue
+                break
+            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+                break                                   # p. ej. redirección a la portada (HTML, no JSON)
+    return None
